@@ -1,30 +1,40 @@
 #include <ModbusRTUSlave.h>
 #include <HX711.h>
 #include <EEPROM.h>
+#include <scale_logic.h>
 #define HX_DOUT    3
 #define HX_SCK     2
 #define DE_RE_PIN  4
+// No sample for this long = load cell fault. HX711 is 10 SPS by default and
+// needs ~400 ms after power-up.
+#define HX_TIMEOUT_MS 500
 HX711 scale;
+class Hx711LoadCell : public LoadCell
+{
+public:
+  bool isReady() override { return scale.is_ready(); }
+  long read() override { return scale.read(); }   // returns at once when isReady()
+};
+Hx711LoadCell loadCell;
+Sampler sampler;
 ModbusRTUSlave modbus(Serial, DE_RE_PIN);
 uint16_t regs[30];
 enum
 {
   REG_WEIGHT      = 0,
+  REG_STATUS      = 1,
   REG_CMD         = 12,
   REG_KNOWN_W     = 13,
   REG_ADDR        = 20,
   REG_BAUD        = 21
 };
-struct Config
-{
-  uint8_t address;
-  uint8_t baudCode;
-  float scaleFactor;
-  uint16_t knownWeight;
-  uint16_t averageCount;
-  long offset;          // Changed to long (HX711 offset is a long)
-};
+// REG_STATUS bits
+#define STATUS_LOADCELL_FAULT 0x0001   // no HX711 sample for HX_TIMEOUT_MS
+#define STATUS_CAL_REJECTED   0x0002   // last calibration rejected (no load / no known weight)
+#define STATUS_OVERRANGE      0x0004   // weight clamped to the int16 range
 Config cfg;
+// Command waiting for the next full block of samples (CMD_NONE if idle).
+uint16_t pendingCmd = CMD_NONE;
 const long baudTable[] =
 {
   0,
@@ -35,15 +45,8 @@ const long baudTable[] =
 // ---------------- EEPROM ----------------
 void loadConfig() {
   EEPROM.get(0, cfg);
-  if (cfg.address < 1 || cfg.address > 255 ||
-      cfg.baudCode < 1 || cfg.baudCode > 3 ||
-      isnan(cfg.scaleFactor) || cfg.scaleFactor == 0) {
-    cfg.address = 3;
-    cfg.baudCode = 3;
-    cfg.scaleFactor = 1.0;
-    cfg.knownWeight = 4;
-    cfg.averageCount = 30;
-    cfg.offset = 0;
+  if (!isConfigValid(cfg)) {
+    cfg = defaultConfig();
   }
 }
 void saveConfig() {
@@ -58,70 +61,88 @@ void restartModbus()
   modbus.configureHoldingRegisters(regs, 30);
   modbus.begin(cfg.address, baud);
 }
+void setStatus(uint16_t bit, bool on)
+{
+  if (on)
+    regs[REG_STATUS] |= bit;
+  else
+    regs[REG_STATUS] &= ~bit;
+}
 void setup() {
   loadConfig();
   restartModbus();
   scale.begin(HX_DOUT, HX_SCK);
-  // **KEY FIX: Restore saved calibration on startup**
-  scale.set_scale(cfg.scaleFactor);
-  scale.set_offset(cfg.offset);
+  sampler.begin(millis());
   regs[REG_KNOWN_W] = cfg.knownWeight;
   regs[REG_ADDR] = cfg.address;
   regs[REG_BAUD] = cfg.baudCode;
 }
+void runCommand(uint16_t cmd, long raw)
+{
+  if (cmd == CMD_TARE)
+  {
+    cfg.offset = raw;
+    saveConfig();
+  }
+  else if (cmd == CMD_CALIBRATE)
+  {
+    bool ok = computeScaleFactor(raw, cfg.offset, cfg.knownWeight, cfg.scaleFactor);
+    setStatus(STATUS_CAL_REJECTED, !ok);
+    if (ok)
+      saveConfig();
+  }
+}
 void loop() {
   modbus.poll();
-  // WEIGHT
-  int16_t weight10 = (int16_t)(scale.get_units(cfg.averageCount) * 10.0f);
-  regs[REG_WEIGHT] = weight10;
-  // TARE
-  if (regs[REG_CMD] == 1)
-  {
-    scale.tare(cfg.averageCount);
-    cfg.offset = scale.get_offset();  // Use get_offset() after tare
-    saveConfig();
-    regs[REG_CMD] = 0;
-  }
-  // CALIBRATE
-  if (regs[REG_CMD] == 2)
-  {
-    if (regs[REG_KNOWN_W] > 0)
-    {
-      cfg.knownWeight = regs[REG_KNOWN_W];
-      long reading = scale.read_average(cfg.averageCount);
-      cfg.scaleFactor = (float)(reading - cfg.offset) / (float)cfg.knownWeight;
-      scale.set_scale(cfg.scaleFactor);
-      saveConfig();
-    }
-    regs[REG_CMD] = 0;
-  }
   // KNOWN WEIGHT (only save, don't recalibrate)
   if (regs[REG_KNOWN_W] != cfg.knownWeight)
   {
     cfg.knownWeight = regs[REG_KNOWN_W];
     saveConfig();
   }
-  // ADDRESS
-  if (regs[REG_ADDR] != cfg.address)
+  // COMMAND: accepted on write, run on the next full block so it only uses
+  // samples taken after it arrived. REG_CMD reads non-zero until it is done.
+  if (regs[REG_CMD] != pendingCmd)
   {
-    uint8_t addr = regs[REG_ADDR];
-    if (addr >= 1 && addr <= 255)
+    pendingCmd = acceptCommand(regs[REG_CMD], regs[REG_KNOWN_W]);
+    regs[REG_CMD] = pendingCmd;
+    if (pendingCmd != CMD_NONE)
+      sampler.restart();
+  }
+  // WEIGHT (never waits for the HX711; on fault the last good weight stays)
+  uint32_t now = millis();
+  long raw;
+  if (sampler.poll(loadCell, cfg.averageCount, now, raw))
+  {
+    if (pendingCmd != CMD_NONE)
     {
-      cfg.address = addr;
-      saveConfig();
-      restartModbus();
+      runCommand(pendingCmd, raw);
+      pendingCmd = CMD_NONE;
+      regs[REG_CMD] = CMD_NONE;
     }
+    bool overRange;
+    regs[REG_WEIGHT] = weightToRegister(rawToUnits(raw, cfg.offset, cfg.scaleFactor), overRange);
+    setStatus(STATUS_OVERRANGE, overRange);
+  }
+  // LOAD CELL FAULT: drop any pending command
+  bool fault = sampler.faulted(now, HX_TIMEOUT_MS);
+  setStatus(STATUS_LOADCELL_FAULT, fault);
+  if (fault && pendingCmd != CMD_NONE)
+  {
+    pendingCmd = CMD_NONE;
+    regs[REG_CMD] = CMD_NONE;
+  }
+  // ADDRESS
+  if (applyAddressWrite(regs[REG_ADDR], cfg.address))
+  {
+    saveConfig();
+    restartModbus();
   }
   // BAUD
-  if (regs[REG_BAUD] != cfg.baudCode)
+  if (applyBaudWrite(regs[REG_BAUD], cfg.baudCode))
   {
-    uint8_t baudCode = regs[REG_BAUD];
-    if (baudCode >= 1 && baudCode <= 3)
-    {
-      cfg.baudCode = baudCode;
-      saveConfig();
-      restartModbus();
-    }
+    saveConfig();
+    restartModbus();
   }
 }
 
